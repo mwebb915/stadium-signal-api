@@ -101,3 +101,80 @@ app.post("/api/push/test-send", requireAdmin, async (req, res) => {
 
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
+
+const DIGEST_CHECK_MS = 15 * 60 * 1000;   // poll every 15m
+const DIGEST_SEND_MS = 2 * 60 * 60 * 1000; // send every 2h
+
+let seenRowHashes = new Set();
+let pendingTeamCounts = new Map();
+let lastDigestSentAt = 0;
+
+function hashRow(row) {
+  return row.trim();
+}
+
+function parseCsvRows(csv) {
+  const lines = csv.split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",").map(h => h.trim().toLowerCase());
+  const teamIdx = headers.findIndex(h => h.includes("team"));
+  if (teamIdx === -1) return [];
+
+  return lines.slice(1).map(line => {
+    const cols = line.split(",");
+    return {
+      raw: line,
+      team: (cols[teamIdx] || "").trim()
+    };
+  }).filter(r => r.team.length > 0);
+}
+
+async function fetchLatestRows() {
+  const response = await fetch(SHEET_URL);
+  if (!response.ok) throw new Error(`Sheet fetch failed: ${response.status}`);
+  const csv = await response.text();
+  return parseCsvRows(csv);
+}
+
+async function collectNewRowsIntoDigest() {
+  const rows = await fetchLatestRows();
+  for (const row of rows) {
+    const h = hashRow(row.raw);
+    if (seenRowHashes.has(h)) continue;
+    seenRowHashes.add(h);
+    pendingTeamCounts.set(row.team, (pendingTeamCounts.get(row.team) || 0) + 1);
+  }
+}
+
+function buildDigestBody() {
+  const entries = [...pendingTeamCounts.entries()].sort((a, b) => b[1] - a[1]);
+  const totalNew = entries.reduce((n, [, c]) => n + c, 0);
+  const top3 = entries.slice(0, 3).map(([team]) => team);
+  const remaining = Math.max(0, entries.length - 3);
+
+  if (remaining > 0) {
+    return `${totalNew} new giveaways by ${top3.join(", ")} + ${remaining} more`;
+  }
+  return `${totalNew} new giveaways by ${top3.join(", ")}`;
+}
+
+async function sendDigestIfNeeded() {
+  const now = Date.now();
+  if (pendingTeamCounts.size === 0) return;
+  if (now - lastDigestSentAt < DIGEST_SEND_MS) return;
+
+  const provider = getApnsProvider();
+  const body = buildDigestBody();
+
+  for (const token of deviceTokens) {
+    const note = new apn.Notification();
+    note.topic = process.env.APNS_TOPIC;
+    note.alert = { title: "New giveaways added", body };
+    note.sound = "default";
+    await provider.send(note, token);
+  }
+
+  provider.shutdown();
+  pendingTeamCounts.clear();
+  lastDigestSentAt = now;
+}
