@@ -100,7 +100,7 @@ app.post("/api/push/test-send", requireAdmin, async (req, res) => {
 });
 
 const DIGEST_CHECK_MS = 15 * 60 * 1000;   // poll every 15m
-const DIGEST_SEND_MS = 2 * 60 * 60 * 1000; // send every 2h
+const DIGEST_SEND_MS = 2 * 60 * 1000; // send every 2h
 
 let seenRowHashes = new Set();
 let pendingTeamCounts = new Map();
