@@ -56,10 +56,13 @@ function parseCsvRows(csv) {
   const teamIdx = headers.findIndex((h) => h.includes("team"));
   if (teamIdx === -1) return [];
 
-  return lines.slice(1).map((line) => {
-    const cols = line.split(",");
-    return { raw: line, team: (cols[teamIdx] || "").trim() };
-  }).filter((r) => r.team.length > 0);
+  return lines
+    .slice(1)
+    .map((line) => {
+      const cols = line.split(",");
+      return { raw: line, team: (cols[teamIdx] || "").trim() };
+    })
+    .filter((r) => r.team.length > 0);
 }
 
 async function fetchLatestRows() {
@@ -125,7 +128,9 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.get("/api/csv", async (_req, res) => {
   try {
     const response = await fetch(SHEET_URL);
-    if (!response.ok) return res.status(502).json({ ok: false, error: `Sheet fetch failed: ${response.status}` });
+    if (!response.ok) {
+      return res.status(502).json({ ok: false, error: `Sheet fetch failed: ${response.status}` });
+    }
     const csv = await response.text();
     return res.type("text/csv").send(csv);
   } catch (error) {
@@ -138,6 +143,7 @@ app.post("/api/push/register-device", (req, res) => {
   const { token, platform } = req.body || {};
   if (!token || !platform) return res.status(400).json({ ok: false, error: "Missing token/platform" });
   if (platform !== "ios") return res.status(400).json({ ok: false, error: "Only ios supported" });
+
   deviceTokens.add(token);
   return res.status(200).json({ ok: true, registered: deviceTokens.size });
 });
@@ -163,6 +169,7 @@ app.post("/api/push/test-send", requireAdmin, async (req, res) => {
 
     const result = await provider.send(note, token);
     provider.shutdown();
+
     return res.json({ ok: true, result });
   } catch (error) {
     console.error("push send error:", error);
