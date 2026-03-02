@@ -7,9 +7,24 @@ app.use(express.json());
 
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-app.get("/api/csv", (_req, res) => {
-  const p = path.join(__dirname, "promos.csv");
-  res.type("text/csv").send(fs.readFileSync(p, "utf8"));
+app.get("/api/csv", async (_req, res) => {
+  try {
+    const url = process.env.GOOGLE_SHEET_CSV_URL;
+    if (!url) {
+      return res.status(500).json({ ok: false, error: "Missing GOOGLE_SHEET_CSV_URL" });
+    }
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      return res.status(502).json({ ok: false, error: `Sheet fetch failed: ${response.status}` });
+    }
+
+    const csv = await response.text();
+    return res.type("text/csv").send(csv);
+  } catch (error) {
+    console.error("csv proxy error:", error);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
 });
 
 app.post("/api/push/register-device", (req, res) => {
