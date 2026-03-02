@@ -11,10 +11,7 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.get("/api/csv", async (_req, res) => {
   try {
-    const url = process.env.GOOGLE_SHEET_CSV_URL;
-    if (!url) {
-      return res.status(500).json({ ok: false, error: "Missing GOOGLE_SHEET_CSV_URL" });
-    }
+    const url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrbyTTdk5GP8_dUIifaPtvavCFbTvSk1PHGAiLYqcZIWteTf25nz-wjrq2e8LGYYKXxmPumSUxGCW0/pub?gid=485285881&single=true&output=csv";
 
     const response = await fetch(url);
     if (!response.ok) {
