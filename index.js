@@ -1,3 +1,5 @@
+console.log("HAS_SHEET_URL", !!process.env.GOOGLE_SHEET_CSV_URL);
+
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
