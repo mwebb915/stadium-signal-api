@@ -100,7 +100,6 @@ app.post("/api/push/test-send", requireAdmin, async (req, res) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
 
 const DIGEST_CHECK_MS = 15 * 60 * 1000;   // poll every 15m
 const DIGEST_SEND_MS = 2 * 60 * 60 * 1000; // send every 2h
@@ -178,3 +177,14 @@ async function sendDigestIfNeeded() {
   pendingTeamCounts.clear();
   lastDigestSentAt = now;
 }
+setInterval(async () => {
+  try {
+    await collectNewRowsIntoDigest();
+    await sendDigestIfNeeded();
+  } catch (e) {
+    console.error("digest loop error:", e);
+  }
+}, DIGEST_CHECK_MS);
+
+const PORT = Number(process.env.PORT) || 3000;
+app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
