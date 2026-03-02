@@ -99,8 +99,6 @@ app.post("/api/push/test-send", requireAdmin, async (req, res) => {
   }
 });
 
-const PORT = Number(process.env.PORT) || 3000;
-
 const DIGEST_CHECK_MS = 15 * 60 * 1000;   // poll every 15m
 const DIGEST_SEND_MS = 2 * 60 * 60 * 1000; // send every 2h
 
