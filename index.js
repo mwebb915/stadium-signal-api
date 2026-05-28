@@ -8,10 +8,12 @@ const SHEET_URL =
   process.env.GOOGLE_SHEET_CSV_URL ||
   "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrbyTTdk5GP8_dUIifaPtvavCFbTvSk1PHGAiLYqcZIWteTf25nz-wjrq2e8LGYYKXxmPumSUxGCW0/pub?gid=485285881&single=true&output=csv";
 
+const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
 const DIGEST_CHECK_MS = 15 * 60 * 1000;
 const DIGEST_SEND_MS = 2 * 60 * 60 * 1000;
 
 const deviceTokens = new Set();
+const pushDevices = new Map();
 const seenRowHashes = new Set();
 const pendingTeamCounts = new Map();
 
@@ -62,6 +64,79 @@ function parseCsvRows(csv) {
   }).filter((r) => r.team.length > 0);
 }
 
+function isExpoPushToken(token) {
+  return typeof token === "string" && /^(ExpoPushToken|ExponentPushToken)\[.+\]$/.test(token);
+}
+
+function getSavedGameIds(value) {
+  return Array.isArray(value) ? value.filter(Boolean).map(String) : [];
+}
+
+function normalizeAndroidPushDevice(payload = {}) {
+  const installId = typeof payload.installId === "string" ? payload.installId.trim() : "";
+  const expoPushToken =
+    typeof payload.expoPushToken === "string" ? payload.expoPushToken.trim() : "";
+  const platform = typeof payload.platform === "string" ? payload.platform.trim() : "";
+
+  if (!installId) return { error: "Missing installId" };
+  if (platform !== "android") return { error: "Only android Expo push tokens are supported here" };
+  if (!isExpoPushToken(expoPushToken)) return { error: "Invalid Expo push token" };
+
+  return {
+    installId,
+    platform,
+    expoPushToken,
+    projectId: payload.projectId || "",
+    appVersion: payload.appVersion || "",
+    nativeBuildVersion: payload.nativeBuildVersion || "",
+    deviceName: payload.deviceName || "",
+    osName: payload.osName || "",
+    osVersion: payload.osVersion || "",
+    timezone: payload.timezone || "",
+    savedGameIds: getSavedGameIds(payload.savedGameIds),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function getAndroidPushDevices() {
+  return [...pushDevices.values()].filter((device) => isExpoPushToken(device.expoPushToken));
+}
+
+function removeExpoPushToken(token) {
+  for (const [installId, device] of pushDevices.entries()) {
+    if (device.expoPushToken === token) {
+      pushDevices.delete(installId);
+    }
+  }
+}
+
+async function sendExpoPushMessages(messages) {
+  if (!messages.length) return { sent: 0, tickets: [] };
+
+  const response = await fetch(EXPO_PUSH_URL, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(messages)
+  });
+
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(json.errors?.[0]?.message || `Expo push failed: ${response.status}`);
+  }
+
+  const tickets = Array.isArray(json.data) ? json.data : [json.data].filter(Boolean);
+  tickets.forEach((ticket, index) => {
+    if (ticket?.status === "error" && ticket?.details?.error === "DeviceNotRegistered") {
+      removeExpoPushToken(messages[index]?.to);
+    }
+  });
+
+  return { sent: messages.length, tickets };
+}
+
 async function fetchLatestRows() {
   const response = await fetch(SHEET_URL);
   if (!response.ok) throw new Error(`Sheet fetch failed: ${response.status}`);
@@ -104,18 +179,34 @@ async function sendDigestIfNeeded() {
   if (pendingTeamCounts.size === 0) return;
   if (now - lastDigestSentAt < DIGEST_SEND_MS) return;
 
-  const provider = getApnsProvider();
   const body = buildDigestBody();
 
-  for (const token of deviceTokens) {
-    const note = new apn.Notification();
-    note.topic = process.env.APNS_TOPIC;
-    note.alert = { title: "New giveaways added", body };
-    note.sound = "default";
-    await provider.send(note, token);
+  if (deviceTokens.size > 0) {
+    const provider = getApnsProvider();
+    for (const token of deviceTokens) {
+      const note = new apn.Notification();
+      note.topic = process.env.APNS_TOPIC;
+      note.alert = { title: "New giveaways added", body };
+      note.sound = "default";
+      await provider.send(note, token);
+    }
+    provider.shutdown();
   }
 
-  provider.shutdown();
+  const androidMessages = getAndroidPushDevices().map((device) => ({
+    to: device.expoPushToken,
+    title: "New giveaways added",
+    body,
+    sound: "default",
+    channelId: "default",
+    data: {
+      type: "new_giveaways_digest",
+      tab: "all",
+      source: "stadium-signal-api"
+    }
+  }));
+  await sendExpoPushMessages(androidMessages);
+
   pendingTeamCounts.clear();
   lastDigestSentAt = now;
 }
@@ -142,28 +233,84 @@ app.post("/api/push/register-device", (req, res) => {
   return res.status(200).json({ ok: true, registered: deviceTokens.size });
 });
 
+app.post("/api/push/register", (req, res) => {
+  const device = normalizeAndroidPushDevice(req.body);
+  if (device.error) return res.status(400).json({ ok: false, error: device.error });
+
+  pushDevices.set(device.installId, device);
+  return res.status(200).json({
+    ok: true,
+    registered: pushDevices.size,
+    installId: device.installId
+  });
+});
+
+app.post("/api/push/preferences", (req, res) => {
+  const device = normalizeAndroidPushDevice(req.body);
+  if (device.error) return res.status(400).json({ ok: false, error: device.error });
+
+  const existing = pushDevices.get(device.installId) || {};
+  pushDevices.set(device.installId, { ...existing, ...device });
+  return res.status(200).json({
+    ok: true,
+    updated: true,
+    installId: device.installId,
+    savedGameCount: device.savedGameIds.length
+  });
+});
+
 app.get("/api/push/tokens", requireAdmin, (_req, res) => {
-  res.json({ ok: true, count: deviceTokens.size });
+  res.json({
+    ok: true,
+    count: deviceTokens.size,
+    iosCount: deviceTokens.size,
+    androidCount: pushDevices.size
+  });
 });
 
 app.post("/api/push/test-send", requireAdmin, async (req, res) => {
   try {
-    const token = req.body?.token || [...deviceTokens][0];
-    if (!token) return res.status(400).json({ ok: false, error: "No device token available" });
+    const explicitToken = req.body?.token;
+    const requestedPlatform = req.body?.platform;
+    const title = req.body?.title || "Stadium Signal";
+    const body = req.body?.body || "Test push from Railway";
+
+    if (requestedPlatform === "android" || isExpoPushToken(explicitToken)) {
+      const token = explicitToken || getAndroidPushDevices()[0]?.expoPushToken;
+      if (!token) {
+        return res.status(400).json({ ok: false, error: "No Android Expo push token available" });
+      }
+
+      const result = await sendExpoPushMessages([
+        {
+          to: token,
+          title,
+          body,
+          sound: "default",
+          channelId: "default",
+          data: {
+            type: "test",
+            tab: "myList",
+            source: "stadium-signal-api"
+          }
+        }
+      ]);
+      return res.json({ ok: true, platform: "android", result });
+    }
+
+    const token = explicitToken || [...deviceTokens][0];
+    if (!token) return res.status(400).json({ ok: false, error: "No iOS device token available" });
 
     const provider = getApnsProvider();
     const note = new apn.Notification();
     note.topic = process.env.APNS_TOPIC;
-    note.alert = {
-      title: req.body?.title || "Stadium Signal",
-      body: req.body?.body || "Test push from Railway"
-    };
+    note.alert = { title, body };
     note.sound = "default";
     note.payload = { source: "stadium-signal-api" };
 
     const result = await provider.send(note, token);
     provider.shutdown();
-    return res.json({ ok: true, result });
+    return res.json({ ok: true, platform: "ios", result });
   } catch (error) {
     console.error("push send error:", error);
     return res.status(500).json({ ok: false, error: error.message || "Push send failed" });
