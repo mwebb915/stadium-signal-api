@@ -1,16 +1,46 @@
 const express = require("express");
 const apn = require("apn");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(express.json());
 
-const SHEET_URL =
+const BASEBALL_SHEET_URL =
   process.env.GOOGLE_SHEET_CSV_URL ||
   "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrbyTTdk5GP8_dUIifaPtvavCFbTvSk1PHGAiLYqcZIWteTf25nz-wjrq2e8LGYYKXxmPumSUxGCW0/pub?gid=485285881&single=true&output=csv";
+
+const SUPPLEMENTAL_SHEET_BASE_URL =
+  "https://docs.google.com/spreadsheets/d/e/2PACX-1vREkk-eLUS8420RhfAG9NaYH4_b4NK1L0_BWfx9o2_ky6F5EDjWz6zTJJML0etfgfV0--z0bqB7KxAp/pub?output=csv";
+
+const DEFAULT_SHEET_SOURCES = [
+  { sport: "baseball", url: BASEBALL_SHEET_URL },
+  { sport: "NBA", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=83950458` },
+  { sport: "NHL", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=1720312924` },
+  { sport: "NFL", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=32429578` },
+  { sport: "WNBA", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=1283244495` },
+  { sport: "MLS", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=187494945` },
+  { sport: "NWSL", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=1920437643` }
+];
+
+function getSheetSources() {
+  if (!process.env.SHEET_SOURCES_JSON) return DEFAULT_SHEET_SOURCES;
+
+  const configured = JSON.parse(process.env.SHEET_SOURCES_JSON);
+  if (!Array.isArray(configured) || configured.some((source) => !source?.sport || !source?.url)) {
+    throw new Error("SHEET_SOURCES_JSON must be an array of { sport, url } objects");
+  }
+  return configured;
+}
+
+const sheetSources = getSheetSources();
 
 const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
 const DIGEST_CHECK_MS = 15 * 60 * 1000;
 const DIGEST_SEND_MS = 2 * 60 * 60 * 1000;
+const STATE_DIRECTORY = process.env.DATA_DIR || path.join(process.cwd(), ".data");
+const STATE_FILE = path.join(STATE_DIRECTORY, "push-state.json");
 
 const deviceTokens = new Set();
 const pushDevices = new Map();
@@ -19,6 +49,45 @@ const pendingTeamCounts = new Map();
 
 let baselineInitialized = false;
 let lastDigestSentAt = 0;
+
+function persistState() {
+  const state = {
+    version: 1,
+    deviceTokens: [...deviceTokens],
+    pushDevices: [...pushDevices.entries()],
+    seenRowHashes: [...seenRowHashes],
+    pendingTeamCounts: [...pendingTeamCounts.entries()],
+    baselineInitialized,
+    lastDigestSentAt
+  };
+
+  fs.mkdirSync(STATE_DIRECTORY, { recursive: true });
+  const temporaryFile = `${STATE_FILE}.tmp`;
+  fs.writeFileSync(temporaryFile, JSON.stringify(state));
+  fs.renameSync(temporaryFile, STATE_FILE);
+}
+
+function restoreState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return;
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+
+    for (const token of state.deviceTokens || []) deviceTokens.add(token);
+    for (const [installId, device] of state.pushDevices || []) pushDevices.set(installId, device);
+    for (const hash of state.seenRowHashes || []) seenRowHashes.add(hash);
+    for (const [team, count] of state.pendingTeamCounts || []) pendingTeamCounts.set(team, count);
+    baselineInitialized = state.baselineInitialized === true && seenRowHashes.size > 0;
+    lastDigestSentAt = Number(state.lastDigestSentAt) || 0;
+
+    console.log(
+      `State restored: ${deviceTokens.size} iOS devices, ${pushDevices.size} Android devices, ${seenRowHashes.size} rows`
+    );
+  } catch (error) {
+    console.error("state restore error:", error);
+  }
+}
+
+restoreState();
 
 function getApnsProvider() {
   const rawKey = process.env.APNS_P8_KEY;
@@ -48,7 +117,7 @@ function requireAdmin(req, res, next) {
 }
 
 function hashRow(row) {
-  return row.trim();
+  return crypto.createHash("sha256").update(row.trim()).digest("hex");
 }
 
 function parseCsvRows(csv) {
@@ -103,11 +172,14 @@ function getAndroidPushDevices() {
 }
 
 function removeExpoPushToken(token) {
+  let changed = false;
   for (const [installId, device] of pushDevices.entries()) {
     if (device.expoPushToken === token) {
       pushDevices.delete(installId);
+      changed = true;
     }
   }
+  if (changed) persistState();
 }
 
 async function sendExpoPushMessages(messages) {
@@ -137,29 +209,51 @@ async function sendExpoPushMessages(messages) {
   return { sent: messages.length, tickets };
 }
 
-async function fetchLatestRows() {
-  const response = await fetch(SHEET_URL);
-  if (!response.ok) throw new Error(`Sheet fetch failed: ${response.status}`);
+async function fetchLatestRows(source) {
+  const response = await fetch(source.url);
+  if (!response.ok) throw new Error(`${source.sport} sheet fetch failed: ${response.status}`);
   const csv = await response.text();
-  return parseCsvRows(csv);
+  return parseCsvRows(csv).map((row) => ({ ...row, sport: source.sport }));
+}
+
+async function fetchAllLatestRows() {
+  const results = await Promise.allSettled(sheetSources.map(fetchLatestRows));
+  const rows = [];
+
+  results.forEach((result, index) => {
+    if (result.status === "fulfilled") {
+      rows.push(...result.value);
+    } else {
+      console.error(`${sheetSources[index].sport} sheet error:`, result.reason);
+    }
+  });
+
+  if (results.every((result) => result.status === "rejected")) {
+    throw new Error("All sheet fetches failed");
+  }
+  return rows;
 }
 
 async function initializeBaselineOnce() {
   if (baselineInitialized) return;
-  const rows = await fetchLatestRows();
-  for (const row of rows) seenRowHashes.add(hashRow(row.raw));
+  const rows = await fetchAllLatestRows();
+  for (const row of rows) seenRowHashes.add(`${row.sport}:${hashRow(row.raw)}`);
   baselineInitialized = true;
+  persistState();
   console.log(`Baseline initialized with ${seenRowHashes.size} rows`);
 }
 
 async function collectNewRowsIntoDigest() {
-  const rows = await fetchLatestRows();
+  const rows = await fetchAllLatestRows();
+  let changed = false;
   for (const row of rows) {
-    const h = hashRow(row.raw);
+    const h = `${row.sport}:${hashRow(row.raw)}`;
     if (seenRowHashes.has(h)) continue;
     seenRowHashes.add(h);
     pendingTeamCounts.set(row.team, (pendingTeamCounts.get(row.team) || 0) + 1);
+    changed = true;
   }
+  if (changed) persistState();
 }
 
 function buildDigestBody() {
@@ -180,6 +274,7 @@ async function sendDigestIfNeeded() {
   if (now - lastDigestSentAt < DIGEST_SEND_MS) return;
 
   const body = buildDigestBody();
+  const teams = [...pendingTeamCounts.keys()];
 
   if (deviceTokens.size > 0) {
     const provider = getApnsProvider();
@@ -188,6 +283,11 @@ async function sendDigestIfNeeded() {
       note.topic = process.env.APNS_TOPIC;
       note.alert = { title: "New giveaways added", body };
       note.sound = "default";
+      note.payload = {
+        type: "new_giveaways_digest",
+        teams,
+        source: "stadium-signal-api"
+      };
       await provider.send(note, token);
     }
     provider.shutdown();
@@ -209,13 +309,14 @@ async function sendDigestIfNeeded() {
 
   pendingTeamCounts.clear();
   lastDigestSentAt = now;
+  persistState();
 }
 
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.get("/api/csv", async (_req, res) => {
   try {
-    const response = await fetch(SHEET_URL);
+    const response = await fetch(BASEBALL_SHEET_URL);
     if (!response.ok) return res.status(502).json({ ok: false, error: `Sheet fetch failed: ${response.status}` });
     const csv = await response.text();
     return res.type("text/csv").send(csv);
@@ -230,6 +331,7 @@ app.post("/api/push/register-device", (req, res) => {
   if (!token || !platform) return res.status(400).json({ ok: false, error: "Missing token/platform" });
   if (platform !== "ios") return res.status(400).json({ ok: false, error: "Only ios supported" });
   deviceTokens.add(token);
+  persistState();
   return res.status(200).json({ ok: true, registered: deviceTokens.size });
 });
 
@@ -238,6 +340,7 @@ app.post("/api/push/register", (req, res) => {
   if (device.error) return res.status(400).json({ ok: false, error: device.error });
 
   pushDevices.set(device.installId, device);
+  persistState();
   return res.status(200).json({
     ok: true,
     registered: pushDevices.size,
@@ -251,6 +354,7 @@ app.post("/api/push/preferences", (req, res) => {
 
   const existing = pushDevices.get(device.installId) || {};
   pushDevices.set(device.installId, { ...existing, ...device });
+  persistState();
   return res.status(200).json({
     ok: true,
     updated: true,
@@ -265,6 +369,15 @@ app.get("/api/push/tokens", requireAdmin, (_req, res) => {
     count: deviceTokens.size,
     iosCount: deviceTokens.size,
     androidCount: pushDevices.size
+  });
+});
+
+app.get("/api/push/sources", requireAdmin, (_req, res) => {
+  res.json({
+    ok: true,
+    checkIntervalMinutes: DIGEST_CHECK_MS / 60_000,
+    digestIntervalMinutes: DIGEST_SEND_MS / 60_000,
+    sources: sheetSources.map(({ sport }) => sport)
   });
 });
 
