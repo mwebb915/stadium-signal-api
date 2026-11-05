@@ -42,7 +42,7 @@ const DIGEST_SEND_MS = 2 * 60 * 60 * 1000;
 const STATE_DIRECTORY = process.env.DATA_DIR || path.join(process.cwd(), ".data");
 const STATE_FILE = path.join(STATE_DIRECTORY, "push-state.json");
 
-const deviceTokens = new Set();
+const deviceTokens = new Map();
 const pushDevices = new Map();
 const seenRowHashes = new Set();
 const pendingTeamCounts = new Map();
@@ -53,7 +53,7 @@ let lastDigestSentAt = 0;
 function persistState() {
   const state = {
     version: 1,
-    deviceTokens: [...deviceTokens],
+    deviceTokens: [...deviceTokens.entries()],
     pushDevices: [...pushDevices.entries()],
     seenRowHashes: [...seenRowHashes],
     pendingTeamCounts: [...pendingTeamCounts.entries()],
@@ -72,7 +72,13 @@ function restoreState() {
     if (!fs.existsSync(STATE_FILE)) return;
     const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
 
-    for (const token of state.deviceTokens || []) deviceTokens.add(token);
+    for (const entry of state.deviceTokens || []) {
+      if (Array.isArray(entry)) {
+        deviceTokens.set(entry[0], entry[1] === "sandbox" ? "sandbox" : "production");
+      } else if (typeof entry === "string") {
+        deviceTokens.set(entry, "production");
+      }
+    }
     for (const [installId, device] of state.pushDevices || []) pushDevices.set(installId, device);
     for (const hash of state.seenRowHashes || []) seenRowHashes.add(hash);
     for (const [team, count] of state.pendingTeamCounts || []) pendingTeamCounts.set(team, count);
@@ -89,7 +95,7 @@ function restoreState() {
 
 restoreState();
 
-function getApnsProvider() {
+function getApnsProvider(environment = "production") {
   const rawKey = process.env.APNS_P8_KEY;
   const key = rawKey ? rawKey.replace(/\\n/g, "\n") : null;
 
@@ -103,7 +109,7 @@ function getApnsProvider() {
       keyId: process.env.APNS_KEY_ID,
       teamId: process.env.APNS_TEAM_ID
     },
-    production: process.env.APNS_PRODUCTION === "true"
+    production: environment === "production"
   });
 }
 
@@ -276,9 +282,14 @@ async function sendDigestIfNeeded() {
   const body = buildDigestBody();
   const teams = [...pendingTeamCounts.keys()];
 
-  if (deviceTokens.size > 0) {
-    const provider = getApnsProvider();
-    for (const token of deviceTokens) {
+  for (const environment of ["sandbox", "production"]) {
+    const tokens = [...deviceTokens.entries()]
+      .filter(([, value]) => value === environment)
+      .map(([token]) => token);
+    if (tokens.length === 0) continue;
+
+    const provider = getApnsProvider(environment);
+    for (const token of tokens) {
       const note = new apn.Notification();
       note.topic = process.env.APNS_TOPIC;
       note.alert = { title: "New giveaways added", body };
@@ -288,10 +299,15 @@ async function sendDigestIfNeeded() {
         teams,
         source: "stadium-signal-api"
       };
-      await provider.send(note, token);
+      const result = await provider.send(note, token);
+      const failure = result.failed?.[0];
+      if (["BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"].includes(failure?.response?.reason)) {
+        deviceTokens.delete(token);
+      }
     }
     provider.shutdown();
   }
+  persistState();
 
   const androidMessages = getAndroidPushDevices().map((device) => ({
     to: device.expoPushToken,
@@ -327,10 +343,13 @@ app.get("/api/csv", async (_req, res) => {
 });
 
 app.post("/api/push/register-device", (req, res) => {
-  const { token, platform } = req.body || {};
+  const { token, platform, environment = "production" } = req.body || {};
   if (!token || !platform) return res.status(400).json({ ok: false, error: "Missing token/platform" });
   if (platform !== "ios") return res.status(400).json({ ok: false, error: "Only ios supported" });
-  deviceTokens.add(token);
+  if (!["sandbox", "production"].includes(environment)) {
+    return res.status(400).json({ ok: false, error: "Invalid APNs environment" });
+  }
+  deviceTokens.set(token, environment);
   persistState();
   return res.status(200).json({ ok: true, registered: deviceTokens.size });
 });
@@ -384,6 +403,7 @@ app.get("/api/push/sources", requireAdmin, (_req, res) => {
 app.post("/api/push/test-send", requireAdmin, async (req, res) => {
   try {
     const explicitToken = req.body?.token;
+    const explicitEnvironment = req.body?.environment;
     const requestedPlatform = req.body?.platform;
     const title = req.body?.title || "Stadium Signal";
     const body = req.body?.body || "Test push from Railway";
@@ -411,10 +431,12 @@ app.post("/api/push/test-send", requireAdmin, async (req, res) => {
       return res.json({ ok: true, platform: "android", result });
     }
 
-    const token = explicitToken || [...deviceTokens][0];
+    const firstRegistration = deviceTokens.entries().next().value;
+    const token = explicitToken || firstRegistration?.[0];
     if (!token) return res.status(400).json({ ok: false, error: "No iOS device token available" });
 
-    const provider = getApnsProvider();
+    const environment = explicitEnvironment || deviceTokens.get(token) || "production";
+    const provider = getApnsProvider(environment);
     const note = new apn.Notification();
     note.topic = process.env.APNS_TOPIC;
     note.alert = { title, body };
@@ -423,7 +445,7 @@ app.post("/api/push/test-send", requireAdmin, async (req, res) => {
 
     const result = await provider.send(note, token);
     provider.shutdown();
-    return res.json({ ok: true, platform: "ios", result });
+    return res.json({ ok: true, platform: "ios", environment, result });
   } catch (error) {
     console.error("push send error:", error);
     return res.status(500).json({ ok: false, error: error.message || "Push send failed" });
