@@ -22,6 +22,13 @@ const DEFAULT_SHEET_SOURCES = [
   { sport: "WNBA", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=1283244495` },
   { sport: "MLS", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=187494945` },
   { sport: "NWSL", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=1920437643` }
+  { sport: "College", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=202610210` },
+  { sport: "MLB", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=202711001` },
+  { sport: "AAA", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=202711002` },
+  { sport: "AA", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=202711003` },
+  { sport: "Low A", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=202711004` },
+  { sport: "High A", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=202711005` },
+  { sport: "Independent", url: `${SUPPLEMENTAL_SHEET_BASE_URL}&gid=202711006` }
 ];
 
 function getSheetSources() {
